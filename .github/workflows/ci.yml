@@ -1,0 +1,50 @@
+name: CI
+
+# Go modules are published by pushing a git tag — proxy.golang.org indexes the
+# repo on first fetch, there is no registry account and nothing to authenticate.
+# That makes this CI the only gate before a tag becomes public and immutable:
+# the module proxy caches a version forever, so a broken tag cannot be recalled.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - run: go build ./...
+      - run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on: $unformatted"
+            exit 1
+          fi
+
+      - run: go test -race ./...
+
+      # A tag that disagrees with the module path is unrecoverable: the proxy
+      # caches it permanently and the only fix is burning a version number.
+      - name: Tag must match the module major version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mod=$(head -1 go.mod | awk '{print $2}')
+          major=${GITHUB_REF_NAME%%.*}      # v0, v1, v2 ...
+          case "$major" in
+            v0|v1) want="github.com/scrape-land/scrapeland-go" ;;
+            *)     want="github.com/scrape-land/scrapeland-go/$major" ;;
+          esac
+          if [ "$mod" != "$want" ]; then
+            echo "::error::tag $GITHUB_REF_NAME needs module path $want, go.mod says $mod"
+            exit 1
+          fi
+          echo "module path OK for $GITHUB_REF_NAME"
