@@ -44,21 +44,48 @@ const (
 // IP, which routinely turns a transient upstream failure into a success.
 var retryStatuses = map[int]bool{429: true, 500: true, 502: true, 503: true, 504: true}
 
+// BatchMaxURLs is the server's per-call cap for Batch; BatchIter chunks by it.
+const BatchMaxURLs = 20
+
 // ErrNoAPIKey is returned by New when no key was passed and none is in the
 // environment.
 var ErrNoAPIKey = errors.New("scrapeland: api key required (pass it or set $SCRAPELAND_API_KEY)")
 
 // APIError is a non-2xx response from the data API. Status is the HTTP code;
-// Body is the (truncated) response body, which usually carries a JSON message.
+// Body is the (truncated) response body, which usually carries a JSON message;
+// RetryAfter is the server's Retry-After, when it sent one. Branch on the kind
+// with the Is* helpers or check Status directly:
+//
+//	var apiErr *scrapeland.APIError
+//	if errors.As(err, &apiErr) && apiErr.IsRateLimited() { time.Sleep(apiErr.RetryAfter) }
 type APIError struct {
-	Status   int
-	Endpoint string
-	Body     string
+	Status     int
+	Endpoint   string
+	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("scrapeland: %s returned HTTP %d: %s", e.Endpoint, e.Status, e.Body)
 }
+
+// IsBadRequest reports a 400 — a malformed or contradictory request (a retry won't help).
+func (e *APIError) IsBadRequest() bool { return e.Status == http.StatusBadRequest }
+
+// IsUnauthorized reports a 401 — the API key is missing, invalid, or revoked.
+func (e *APIError) IsUnauthorized() bool { return e.Status == http.StatusUnauthorized }
+
+// IsPaymentRequired reports a 402 — out of quota / prepaid credit, or key budget spent.
+func (e *APIError) IsPaymentRequired() bool { return e.Status == http.StatusPaymentRequired }
+
+// IsNotFound reports a 404 — no such resource (e.g. an unknown job id).
+func (e *APIError) IsNotFound() bool { return e.Status == http.StatusNotFound }
+
+// IsRateLimited reports a 429 — too many requests; honor RetryAfter.
+func (e *APIError) IsRateLimited() bool { return e.Status == http.StatusTooManyRequests }
+
+// IsServer reports a 5xx — a transient server-side failure, usually worth retrying.
+func (e *APIError) IsServer() bool { return e.Status >= 500 }
 
 // Client talks to the scrape.land gateway and data API. The zero value is not
 // usable — construct it with New.
@@ -120,7 +147,9 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		APIBase: firstNonEmpty(os.Getenv("SCRAPELAND_API_BASE"), DefaultAPIBase),
 		Retries: 2,
 		Backoff: 500 * time.Millisecond,
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		// 180s, matching the API's own budget: an AI extraction on the "smart"
+		// model runs 70-90s, so a 60s client timeout cut it off before the answer.
+		HTTP: &http.Client{Timeout: 180 * time.Second},
 	}
 	for _, o := range opts {
 		o(c)
@@ -197,7 +226,7 @@ func (c *Client) ProxyURL(o *Options) (*url.URL, error) {
 // the first caller's country and session to everyone else.
 func (c *Client) HTTPClient(o *Options) *http.Client {
 	proxy, err := c.ProxyURL(o)
-	timeout := 60 * time.Second
+	timeout := 180 * time.Second
 	if c.HTTP != nil && c.HTTP.Timeout != 0 {
 		timeout = c.HTTP.Timeout
 	}
@@ -257,6 +286,18 @@ type Options struct {
 	Model       string         `json:"model,omitempty"`
 	ExtractType string         `json:"extract_type,omitempty"`
 
+	// TopK caps the list returned by Rank (rank only; ignored elsewhere).
+	TopK int `json:"top_k,omitempty"`
+
+	// Structured selects what a Prompt returns. Nil (the default) and true give a JSON
+	// object in Result.Data; false gives a plain-language reply in Result.Answer and
+	// leaves Data nil. A pointer so "unset" and "explicitly false" differ — use
+	// scrapeland.Bool(false) to ask for prose.
+	//
+	// Schema and ExtractType both pin a JSON shape and so imply structured output;
+	// combining either with Structured=Bool(false) is rejected with a 400.
+	Structured *bool `json:"structured,omitempty"`
+
 	// Search only.
 	Count int `json:"count,omitempty"`
 }
@@ -297,15 +338,48 @@ type Result struct {
 	ContentType string            `json:"content_type,omitempty"`
 	Screenshot  string            `json:"screenshot,omitempty"`
 	Data        map[string]any    `json:"data,omitempty"`
+	Answer      string            `json:"answer,omitempty"`
 	Metadata    map[string]any    `json:"metadata,omitempty"`
 	Links       []string          `json:"links,omitempty"`
 	Headers     map[string]string `json:"headers,omitempty"`
 	Error       string            `json:"error,omitempty"`
 }
 
+// Bool returns a pointer to b, for the optional tri-state Options fields (today:
+// Structured, where nil and false mean different things). Saves every caller writing
+// the same two-line temporary.
+func Bool(b bool) *bool { return &b }
+
 // BatchResult is the response from Batch: one entry per requested URL, in order.
 type BatchResult struct {
 	Results []Result `json:"results"`
+}
+
+// RankedLink is one link scored by Rank: Score is 0-1, Reason is a short rationale.
+type RankedLink struct {
+	URL    string  `json:"url"`
+	Text   string  `json:"text"`
+	Score  float64 `json:"score"`
+	Reason string  `json:"reason"`
+}
+
+// RankResult is the response from Rank. If the AI step failed, Links come back in
+// document order (not ranked) and RankingError explains why — Rank returns no error
+// in that case, so always check RankingError when the order matters.
+type RankResult struct {
+	URL          string       `json:"url"`
+	Status       int          `json:"status"`
+	Query        string       `json:"query"`
+	Links        []RankedLink `json:"links"`
+	RankingError string       `json:"ranking_error,omitempty"`
+}
+
+// rankPayload is Batch/Fetch's payload shape plus the rank-specific query. TopK and
+// Model ride along inside the embedded Options.
+type rankPayload struct {
+	URL   string `json:"url"`
+	Query string `json:"query"`
+	*Options
 }
 
 // SearchResult is the response from Search.
@@ -352,6 +426,48 @@ func (c *Client) Batch(ctx context.Context, urls []string, o *Options) (*BatchRe
 	var out BatchResult
 	err := c.post(ctx, "/v1/batch", payload{URLs: urls, Options: c.applyDefaults(o)}, &out)
 	return &out, err
+}
+
+// Rank scores a page's links by how relevant each is to query, so you can pick which
+// sub-pages to fetch next instead of crawling everything. Set o.TopK to cap the list
+// and o.Model ("fast"/"smart") to choose the backend. It is stateless: it ranks the
+// links a page already has and never fetches them.
+//
+// AI transparency: if the ranking step fails, Rank still returns a result (no error)
+// with the links in document order and RankResult.RankingError set — so check that
+// field when the order matters. Requires the AI backend to be configured. Billed as one
+// fetch plus the AI surcharge; a failed ranking bills only the fetch.
+func (c *Client) Rank(ctx context.Context, target, query string, o *Options) (*RankResult, error) {
+	var out RankResult
+	err := c.post(ctx, "/v1/rank", rankPayload{URL: target, Query: query, Options: c.applyDefaults(o)}, &out)
+	return &out, err
+}
+
+// BatchIter fetches or extracts any number of URLs, auto-chunking into BatchMaxURLs-sized
+// Batch calls and invoking yield for each Result in input order as chunks complete — the
+// streaming counterpart to Batch, so you can feed a slice of any size without holding
+// every response in memory or tripping the 20-URL cap. yield returns false to stop early
+// (the range-over-func convention, so this composes with `for r := range ...` on Go 1.23+).
+// o applies to every URL, exactly like Batch. A failed chunk stops iteration and returns
+// its error (the same *APIError as Batch).
+//
+//	err := c.BatchIter(ctx, urls, &scrapeland.Options{Fields: f}, func(r scrapeland.Result) bool {
+//		save(r); return true
+//	})
+func (c *Client) BatchIter(ctx context.Context, urls []string, o *Options, yield func(Result) bool) error {
+	for i := 0; i < len(urls); i += BatchMaxURLs {
+		end := min(i+BatchMaxURLs, len(urls))
+		res, err := c.Batch(ctx, urls[i:end], o)
+		if err != nil {
+			return err
+		}
+		for _, r := range res.Results {
+			if !yield(r) {
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 // Search runs a web search and returns organic results.
@@ -462,7 +578,11 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 			continue
 		}
 		if resp.StatusCode >= 400 {
-			lastErr = &APIError{Status: resp.StatusCode, Endpoint: path, Body: truncate(string(respBody), 512)}
+			var ra time.Duration
+			if secs, e := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); e == nil && secs > 0 {
+				ra = time.Duration(secs) * time.Second
+			}
+			lastErr = &APIError{Status: resp.StatusCode, Endpoint: path, Body: truncate(string(respBody), 512), RetryAfter: ra}
 			if retryStatuses[resp.StatusCode] {
 				continue
 			}

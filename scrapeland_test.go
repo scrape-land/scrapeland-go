@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -237,6 +238,124 @@ func TestContextCancelStopsRetrying(t *testing.T) {
 	defer cancel()
 	if _, err := c.Fetch(ctx, "https://e.com", nil); err == nil {
 		t.Fatal("expected an error once the context expires")
+	}
+}
+
+func TestRankShapeAndRankingError(t *testing.T) {
+	var path string
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&body)
+		json.NewEncoder(w).Encode(RankResult{
+			URL: "https://e.com", Status: 200, Query: "pricing",
+			Links:        []RankedLink{{URL: "https://e.com/pricing", Text: "Pricing", Score: 0.9, Reason: "exact"}},
+			RankingError: "llm timeout",
+		})
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	res, err := c.Rank(context.Background(), "https://e.com", "pricing", &Options{TopK: 5, Model: "fast", Country: "us"})
+	if err != nil {
+		t.Fatalf("Rank: %v", err)
+	}
+	if path != "/v1/rank" {
+		t.Errorf("path = %q", path)
+	}
+	if body["query"] != "pricing" || body["top_k"] != float64(5) || body["model"] != "fast" || body["country"] != "us" {
+		t.Errorf("payload = %v", body)
+	}
+	if len(res.Links) != 1 || res.Links[0].Score != 0.9 {
+		t.Errorf("links = %+v", res.Links)
+	}
+	// AI transparency: a failed ranking is surfaced on the result, not returned as an error.
+	if res.RankingError != "llm timeout" {
+		t.Errorf("RankingError = %q, want it surfaced", res.RankingError)
+	}
+}
+
+func TestBatchIterChunksAndOrder(t *testing.T) {
+	var chunks []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			URLs []string `json:"urls"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		chunks = append(chunks, len(body.URLs))
+		res := make([]Result, len(body.URLs))
+		for i, u := range body.URLs {
+			res[i] = Result{URL: u, Status: 200}
+		}
+		json.NewEncoder(w).Encode(BatchResult{Results: res})
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	urls := make([]string, 45)
+	for i := range urls {
+		urls[i] = "https://t/" + strconv.Itoa(i)
+	}
+	var got []string
+	err := c.BatchIter(context.Background(), urls, nil, func(r Result) bool {
+		got = append(got, r.URL)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("BatchIter: %v", err)
+	}
+	// 45 URLs auto-chunk into 20 + 20 + 5 (the server's 20-URL cap), one call each.
+	if len(chunks) != 3 || chunks[0] != 20 || chunks[1] != 20 || chunks[2] != 5 {
+		t.Errorf("chunks = %v, want [20 20 5]", chunks)
+	}
+	if len(got) != len(urls) {
+		t.Fatalf("got %d results, want %d", len(got), len(urls))
+	}
+	for i := range got {
+		if got[i] != urls[i] {
+			t.Errorf("order broken at %d: %q != %q", i, got[i], urls[i])
+			break
+		}
+	}
+}
+
+func TestBatchIterStopsWhenYieldReturnsFalse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(BatchResult{Results: []Result{
+			{URL: "https://a", Status: 200}, {URL: "https://b", Status: 200},
+		}})
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv)
+	seen := 0
+	err := c.BatchIter(context.Background(), []string{"https://a", "https://b"}, nil, func(Result) bool {
+		seen++
+		return false // stop after the first
+	})
+	if err != nil || seen != 1 {
+		t.Errorf("seen = %d err = %v, want 1 result then stop", seen, err)
+	}
+}
+
+func TestAPIErrorPredicatesAndRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte("slow down"))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv) // Backoff=1ms, so the 429 retries fly by
+	_, err := c.Fetch(context.Background(), "https://e.com", nil)
+	var apiErr *APIError
+	if !errorsAs(err, &apiErr) {
+		t.Fatalf("err = %T (%v), want *APIError", err, err)
+	}
+	if !apiErr.IsRateLimited() || apiErr.IsUnauthorized() || apiErr.IsServer() {
+		t.Errorf("predicates wrong for 429: %+v", apiErr)
+	}
+	if apiErr.RetryAfter != 5*time.Second {
+		t.Errorf("RetryAfter = %v, want 5s", apiErr.RetryAfter)
 	}
 }
 
